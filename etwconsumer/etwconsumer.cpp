@@ -11,7 +11,57 @@
 #pragma comment(lib, "tdh.lib")
 #include "etwconsumer.h"
 
-USHORT GetEventPropertyLength(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO EventInformation, PEVENT_PROPERTY_INFO EventPropertyInfo)
+inline ULONG get_heuristic_size(
+    const BYTE* propertyStart,
+    const EVENT_PROPERTY_INFO& propertyInfo,
+    const EVENT_RECORD& record)
+{
+    ULONG propertyLength = 0;
+    PBYTE pRecordEnd = (PBYTE)record.UserData + record.UserDataLength;
+
+    // The calls to Tdh are kind of expensive, especially when krabs is
+    // included in a managed assembly as this call will be a thunk.
+    // The following _very_ common property types can be short-circuited
+    // to prevent the expensive call.
+
+    // Be careful! Check IN and OUT types before making an assumption.
+
+    // Strings that appear at the end of a record may not be null-terminated.
+    // If a string is null-terminated, propertyLength includes the null character.
+    // If a string is not-null terminated, propertyLength includes all bytes up
+    // to the end of the record buffer.
+
+    if (propertyInfo.nonStructType.OutType == TDH_OUTTYPE_STRING)
+    {
+        if (propertyInfo.nonStructType.InType == TDH_INTYPE_UNICODESTRING)
+        {
+            auto p = (const wchar_t*)propertyStart;
+            auto pEnd = (const wchar_t*)pRecordEnd;
+            while (p < pEnd) {
+                if (!*p++) {
+                    break;
+                }
+            }
+            propertyLength = static_cast<ULONG>(((PBYTE)p) - propertyStart);
+        }
+        else if (propertyInfo.nonStructType.InType == TDH_INTYPE_ANSISTRING)
+        {
+            auto p = (const char*)propertyStart;
+            auto pEnd = (const char*)pRecordEnd;
+            while (p < pEnd) {
+                if (!*p++) {
+                    break;
+                }
+
+            }
+            propertyLength = static_cast<ULONG>(((PBYTE)p) - propertyStart);
+        }
+    }
+
+    return propertyLength;
+}
+
+USHORT GetEventPropertyLength(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO EventInformation, PEVENT_PROPERTY_INFO EventPropertyInfo, PBYTE UserData)
 {
     USHORT LengthPropertyIndex;
     PROPERTY_DATA_DESCRIPTOR DataDescriptor = { 0 };
@@ -31,14 +81,22 @@ USHORT GetEventPropertyLength(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO Event
             PropertyLength = EventPropertyInfo->length;
         }
         else {
+
+            //
+            // This has bug
+            //
+
             if (TDH_INTYPE_BINARY == EventPropertyInfo->nonStructType.InType &&
                 TDH_OUTTYPE_IPV6 == EventPropertyInfo->nonStructType.OutType) {
+
+                //
+                // sizeof(IN6_ADDR) == 16
+                //
+
                 PropertyLength = 16;
             }
-            else if (TDH_INTYPE_UNICODESTRING == EventPropertyInfo->nonStructType.InType ||
-                     TDH_INTYPE_ANSISTRING == EventPropertyInfo->nonStructType.InType ||
-                     0 != (EventPropertyInfo->Flags & PropertyStruct)) {
-                PropertyLength = EventPropertyInfo->length;
+            else {
+                PropertyLength = get_heuristic_size(UserData, *EventPropertyInfo, *EventRecord);
             }
         }
     }
@@ -49,6 +107,7 @@ USHORT GetEventPropertyLength(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO Event
 std::wstring GetEventPropertyString(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO EventInformation, PEVENT_PROPERTY_INFO EventPropertyInfo, PBYTE UserData, PUSHORT UserDataConsumed)
 {
     ULONG Status = ERROR_SUCCESS;
+    ULONG PointerSize;
     USHORT PropertyLength;
     PWSTR EventMapName;
     ULONG EventMapInformationSize;
@@ -56,8 +115,14 @@ std::wstring GetEventPropertyString(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO
     ULONG BufferSize = 0;
     PWCHAR Buffer;
     std::wstring PropertyString;
+    
+    PointerSize = EventRecord->EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER ? 4 : 8;
+    PropertyLength = EventPropertyInfo->length;
 
-    PropertyLength = GetEventPropertyLength(EventRecord, EventInformation, EventPropertyInfo);
+    if (TDH_INTYPE_BINARY == EventPropertyInfo->nonStructType.InType &&
+        TDH_OUTTYPE_IPV6 == EventPropertyInfo->nonStructType.OutType) {
+        PropertyLength = 16;
+    }
 
     if ((EventPropertyInfo->Flags & PropertyStruct) == 0 &&
         (EventPropertyInfo->Flags & PropertyHasCustomSchema) == 0) {
@@ -78,7 +143,7 @@ std::wstring GetEventPropertyString(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO
         if (ERROR_SUCCESS == Status) {
             Status = TdhFormatProperty(EventInformation,
                                        EventMapInformation,
-                                       sizeof (PVOID),
+                                       PointerSize,
                                        EventPropertyInfo->nonStructType.InType,
                                        EventPropertyInfo->nonStructType.OutType,
                                        PropertyLength,
@@ -94,7 +159,7 @@ std::wstring GetEventPropertyString(PEVENT_RECORD EventRecord, PTRACE_EVENT_INFO
                 if (nullptr != Buffer) {
                     Status = TdhFormatProperty(EventInformation,
                                                EventMapInformation,
-                                               sizeof (PVOID),
+                                               PointerSize,
                                                EventPropertyInfo->nonStructType.InType,
                                                EventPropertyInfo->nonStructType.OutType,
                                                PropertyLength,
@@ -148,6 +213,12 @@ std::unordered_map<std::wstring, std::wstring> EventParseProperty(PEVENT_RECORD 
 
                     if (EventPropertyInfo->NameOffset != 0) {
                         PropertyName = reinterpret_cast<PWCHAR>(reinterpret_cast<PUCHAR>(EventInformation) + EventPropertyInfo->NameOffset);
+
+                        if (PropertyName == L"CommandLine") {
+                            __debugbreak();
+                        }
+
+                        UserDataConsumed = 0;
                         PropertyString = GetEventPropertyString(EventRecord, EventInformation, EventPropertyInfo, UserData, &UserDataConsumed);
                         PropertyMap.insert({ PropertyName , PropertyString });
                         UserData += UserDataConsumed;
@@ -167,7 +238,11 @@ VOID WINAPI EventRecordCallback(PEVENT_RECORD EventRecord)
     std::unordered_map<std::wstring, std::wstring> EventProperty;
     EventProperty = EventParseProperty(EventRecord);
 
-    printf("%ws:%ws", EventProperty[L"CVEID"].c_str(), EventProperty[L"AdditionalDetails"].c_str());
+    for (const auto &Item : EventProperty) {
+        printf("%ws:%ws\r\n", Item.first.c_str(), Item.second.c_str());
+    }
+
+    printf("\r\n");
 }
 
 ULONG WINAPI EventBufferCallback(PEVENT_TRACE_LOGFILEW Logfile)
@@ -181,7 +256,7 @@ VOID ProcessTraceWorker()
     TRACEHANDLE TraceHandle = INVALID_PROCESSTRACE_HANDLE;
     EVENT_TRACE_LOGFILEW EventTraceLogFile = { 0 };
 
-    EventTraceLogFile.LoggerName = RURIWO_LOGGER_NAME;
+    EventTraceLogFile.LoggerName = L"Eventlog-Security";
     EventTraceLogFile.ProcessTraceMode |= PROCESS_TRACE_MODE_REAL_TIME;
     EventTraceLogFile.ProcessTraceMode |= PROCESS_TRACE_MODE_EVENT_RECORD;
     EventTraceLogFile.BufferCallback = EventBufferCallback;
@@ -221,7 +296,7 @@ ULONG RegisterLogger()
         Status = StartTraceW(&TraceHandle, RURIWO_LOGGER_NAME, Properties);
 
         if (ERROR_SUCCESS == Status) {
-            EnableTraceEx(&AuditCveProviderGuid,
+            EnableTraceEx(&SecurityAuditingProviderGuid,
                           nullptr,
                           TraceHandle,
                           EVENT_CONTROL_CODE_ENABLE_PROVIDER,
